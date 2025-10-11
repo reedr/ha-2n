@@ -31,14 +31,9 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     """Validate the user input allows us to connect."""
 
     dev = Hass2NDevice(hass, data[CONF_HOST], data[CONF_USERNAME], data[CONF_PASSWORD])
-    code = await dev.get_system_info()
-
-    if code != httpx.codes.OK:
-        if code == httpx.codes.UNAUTHORIZED:
-            raise InvalidAuth
-        raise CannotConnect
-
-    return {"title": dev.system_info["deviceName"]}
+    if await dev.get_system_info():
+        return {"title": dev._device_name}
+    raise CannotConnect
 
 
 class ConfigFlow(ConfigFlow, domain=DOMAIN):
