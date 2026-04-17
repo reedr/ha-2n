@@ -17,7 +17,7 @@ class Hass2NDeviceResponse:
 
     def __init__(self, resp: httpx.Response) -> None:
         """Set it up."""
-        _LOGGER.debug("<- %d %s: %s", resp.status_code, resp.reason_phrase, re.sub("\s+", " ", resp.text))
+        _LOGGER.debug("<- %d %s: %s", resp.status_code, resp.reason_phrase, re.sub("\\s+", " ", resp.text))
         self._status_code = resp.status_code
         if self._status_code == httpx.codes.OK:
             try:
@@ -128,6 +128,7 @@ class Hass2NDevice:  # noqa: D101
         return False
 
     async def api_get(self, uri: str) -> bool:
+        """Get some API info."""
         return await self.api_call(uri) and self._response.has_result
 
     async def get_system_info(self) -> bool:
