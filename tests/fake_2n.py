@@ -19,6 +19,8 @@ class FakeIntercom:
         self.password_ok = True
         self.down = False
         self.disabled: set[str] = set()
+        self.denied: set[str] = set()
+        self.garbled = False
         self.pending_events: list[dict[str, Any]] = []
         self.log_ids: set[int] = set()
         self.commands: list[str] = []
@@ -38,6 +40,10 @@ class FakeIntercom:
             return httpx.Response(401)
         path, params = request.url.path, request.url.params
         self.commands.append(str(request.url.raw_path, "ascii"))
+        if path.startswith("/api/") and path.split("/")[2] in self.denied:
+            return httpx.Response(401)
+        if self.garbled and path in ("/api/io/status", "/api/switch/status"):
+            return self._ok({"ports": "nonsense", "switches": [{"switch": 1}, 7]})
         if path.startswith("/api/") and path.split("/")[2] in self.disabled:
             return httpx.Response(200, json={"success": False, "error": {"code": 8}})
         if path == "/api/system/info":

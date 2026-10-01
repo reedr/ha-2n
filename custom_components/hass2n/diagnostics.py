@@ -11,7 +11,16 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import TwoNConfigEntry
 
-TO_REDACT = {CONF_PASSWORD, CONF_USERNAME, "serialNumber", "serial"}
+TO_REDACT = {
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    "serialNumber",
+    "serial",
+    "macAddr",
+    "mac",
+    "unique_id",
+    "events",
+}
 
 
 async def async_get_config_entry_diagnostics(
@@ -22,5 +31,5 @@ async def async_get_config_entry_diagnostics(
     return {
         "entry": async_redact_data(entry.as_dict(), TO_REDACT),
         "system_info": async_redact_data(coord.info.raw, TO_REDACT),
-        "state": asdict(coord.data) if coord.data else None,
+        "state": async_redact_data(asdict(coord.data), TO_REDACT) if coord.data else None,
     }

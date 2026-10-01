@@ -28,6 +28,8 @@ class TwoNEntity(CoordinatorEntity[TwoNCoordinator]):
         info = coordinator.info
         self._key = key
         self._attr_unique_id = f"{kind}_{info.device_id}_{key}"
+        # Kept from the pre-HACS package, for templates that read it.
+        self._attr_extra_state_attributes = {"device_id": key}
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, info.device_id)},
             connections={(dr.CONNECTION_NETWORK_MAC, info.mac)},

@@ -32,6 +32,11 @@ class TwoNTriggerButton(TwoNEntity, ButtonEntity):
         super().__init__(coordinator, "button", switch)
         self._attr_name = f"Switch {switch} trigger"
 
+    @property
+    def available(self) -> bool:
+        """Unavailable while the switch API isn't answering."""
+        return super().available and self.coordinator.data.switches is not None
+
     async def async_press(self) -> None:
         """Pulse the switch."""
         await self._async_run(self.coordinator.device.async_trigger(self._key))

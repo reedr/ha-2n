@@ -138,3 +138,65 @@ async def test_setup_failures(hass: HomeAssistant, network, down: bool) -> None:
         assert [f["context"]["source"] for f in hass.config_entries.flow.async_progress()] == [
             "reauth"
         ]
+
+
+async def test_one_refused_section_keeps_polling(hass: HomeAssistant, network) -> None:
+    """A 401 on one API (e.g. no rights to it) doesn't stop the others or start reauth."""
+    await _setup(hass)
+    gate = network.intercoms[GATE["host"]]
+    gate.denied = {"switch"}
+    events = async_capture_events(hass, EVENT)
+    gate.pending_events = [{"id": 1, "event": "KeyPressed", "params": {"key": "%1"}}]
+    await _tick(hass)
+    assert hass.states.get("switch.gate_switch_1").state == STATE_UNAVAILABLE
+    assert hass.states.get("button.gate_switch_1_trigger").state == STATE_UNAVAILABLE
+    assert hass.states.get("binary_sensor.gate_port_relay1").state == STATE_OFF
+    assert len(events) == 1
+    assert hass.config_entries.flow.async_progress() == []
+
+
+async def test_all_refused_starts_reauth(hass: HomeAssistant, network) -> None:
+    await _setup(hass)
+    network.intercoms[GATE["host"]].password_ok = False
+    await _tick(hass)
+    assert [f["context"]["source"] for f in hass.config_entries.flow.async_progress()] == ["reauth"]
+
+
+async def test_garbled_data_keeps_events(hass: HomeAssistant, network) -> None:
+    await _setup(hass)
+    gate = network.intercoms[GATE["host"]]
+    gate.garbled = True
+    events = async_capture_events(hass, EVENT)
+    gate.pending_events = [{"id": 2, "event": "CodeEntered", "params": {"valid": True}}, "junk"]
+    await _tick(hass)
+    assert [e.data["event"] for e in events] == ["CodeEntered"]
+    assert hass.states.get("binary_sensor.gate_port_relay1").state == STATE_UNAVAILABLE
+    assert hass.states.get("binary_sensor.gate_event_tracking").state == STATE_ON
+
+
+async def test_second_entry_for_same_intercom(hass: HomeAssistant, network) -> None:
+    """The same unit under another address is refused rather than polled twice."""
+    await _setup(hass)
+    network.intercoms["gate.local"] = network.intercoms[GATE["host"]]
+    dup = MockConfigEntry(domain=DOMAIN, title="Gate again", data={**GATE, "host": "gate.local"})
+    dup.add_to_hass(hass)
+    await hass.config_entries.async_setup(dup.entry_id)
+    await hass.async_block_till_done()
+    assert dup.state is ConfigEntryState.SETUP_ERROR
+
+
+async def test_diagnostics_redacted(hass: HomeAssistant, network) -> None:
+    from custom_components.hass2n.diagnostics import async_get_config_entry_diagnostics
+
+    entry = await _setup(hass)
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    text = str(diag)
+    assert GATE_MAC not in text
+    assert "pw" not in text
+    assert diag["state"]["events"] == "**REDACTED**"
+
+
+async def test_legacy_device_id_attribute(hass: HomeAssistant, network) -> None:
+    await _setup(hass)
+    assert hass.states.get("switch.gate_switch_1").attributes["device_id"] == 1
+    assert hass.states.get("binary_sensor.gate_port_relay1").attributes["device_id"] == "relay1"

@@ -30,12 +30,24 @@ async def async_migrate_legacy_entry(hass: HomeAssistant, entry: TwoNConfigEntry
     if legacy is not None and legacy.domain == LEGACY_DOMAIN:
         # Loaded entities can't change platform; the legacy package is normally
         # gone by now (this one replaces its folder), but unload it if not.
-        if legacy.state is ConfigEntryState.LOADED:
+        if legacy.state in (
+            ConfigEntryState.LOADED,
+            ConfigEntryState.SETUP_RETRY,
+            ConfigEntryState.SETUP_IN_PROGRESS,
+        ):
             await hass.config_entries.async_unload(legacy_id)
 
         ent_reg = er.async_get(hass)
         dev_reg = dr.async_get(hass)
         for entity in er.async_entries_for_config_entry(ent_reg, legacy_id):
+            if ent_reg.async_get_entity_id(entity.domain, DOMAIN, entity.unique_id):
+                _LOGGER.warning(
+                    "%s: %s already exists under %s; leaving it with the legacy entry",
+                    entity.entity_id,
+                    entity.unique_id,
+                    DOMAIN,
+                )
+                continue
             ent_reg.async_update_entity_platform(
                 entity.entity_id, DOMAIN, new_config_entry_id=entry.entry_id
             )

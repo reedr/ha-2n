@@ -49,6 +49,22 @@ class TwoNState:
     events: list[dict[str, Any]] = field(default_factory=list, compare=False)
 
 
+def _parse(
+    result: dict[str, Any] | None, list_key: str, id_key: str, value_key: str, cast: type
+) -> dict[Any, Any] | None:
+    """Turn ``{"ports": [{"port": .., "state": ..}, ..]}`` into ``{port: state}``.
+
+    Entries missing either field are skipped; a missing list counts as failure.
+    """
+    if result is None or not isinstance(items := result.get(list_key), list):
+        return None
+    return {
+        item[id_key]: cast(item[value_key])
+        for item in items
+        if isinstance(item, dict) and id_key in item and value_key in item
+    }
+
+
 class TwoNDevice:
     """A 2N IP intercom over HTTPS with digest auth."""
 
@@ -80,7 +96,8 @@ class TwoNDevice:
         _LOGGER.debug("%s -> GET %s", self.host, path)
         try:
             resp = await self._client.get(path)
-        except httpx.HTTPError as err:
+        except (httpx.HTTPError, httpx.InvalidURL, RuntimeError) as err:
+            # RuntimeError: the client was closed under us (entry unloading).
             raise TwoNConnectionError(f"{self.host}: {err!r}") from err
         _LOGGER.debug(
             "%s <- %d %s", self.host, resp.status_code, re.sub(r"\s+", " ", resp.text)
@@ -93,9 +110,11 @@ class TwoNDevice:
             body = resp.json()
         except ValueError as err:
             raise TwoNConnectionError(f"{self.host} {path}: not JSON") from err
-        if not body.get("success"):
-            raise TwoNConnectionError(f"{self.host} {path}: {body.get('error')}")
-        return body.get("result") or {}
+        if not isinstance(body, dict) or not body.get("success"):
+            error = body.get("error") if isinstance(body, dict) else body
+            raise TwoNConnectionError(f"{self.host} {path}: {error}")
+        result = body.get("result")
+        return result if isinstance(result, dict) else {}
 
     async def async_get_info(self) -> TwoNInfo:
         """Read the intercom's identity."""
@@ -117,40 +136,46 @@ class TwoNDevice:
     async def async_update(self) -> TwoNState:
         """Poll ports, switches and new log events.
 
-        Each section fails on its own, as the intercom can disable APIs one by
-        one. Only a wrong login, or every section failing, raises.
+        Each section fails on its own, as the intercom can disable APIs (or deny
+        the account) one by one. Only every section failing raises: as an auth
+        error if they were all refused, else as a connection error. Events
+        already pulled are always returned, so they are never lost.
         """
         errors: list[TwoNError] = []
 
-        async def section(path: str, key: str) -> list[dict[str, Any]] | None:
+        async def section(path: str) -> dict[str, Any] | None:
             try:
-                return (await self._get(path)).get(key) or []
-            except TwoNAuthError:
-                raise
+                return await self._get(path)
             except TwoNError as err:
                 errors.append(err)
                 return None
 
-        ports = await section("/api/io/status", "ports")
-        switches = await section("/api/switch/status", "switches")
+        ports = _parse(await section("/api/io/status"), "ports", "port", "state", int)
+        switches = _parse(
+            await section("/api/switch/status"), "switches", "switch", "active", bool
+        )
 
         events: list[dict[str, Any]] | None = None
         if self._log_id is None:
-            subscribed = await section("/api/log/subscribe", "id")
-            self._log_id = subscribed if isinstance(subscribed, int) else None
+            subscribed = await section("/api/log/subscribe")
+            log_id = subscribed.get("id") if subscribed else None
+            self._log_id = log_id if isinstance(log_id, int) else None
         if self._log_id is not None:
-            events = await section(f"/api/log/pull?id={self._log_id}", "events")
-            if events is None:
+            pulled = await section(f"/api/log/pull?id={self._log_id}")
+            if pulled is None:
                 # The subscription lapses when the intercom restarts.
                 self._log_id = None
+            else:
+                raw = pulled.get("events")
+                events = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
 
         if ports is None and switches is None and events is None:
-            raise TwoNConnectionError("; ".join(str(err) for err in errors))
+            if errors and all(isinstance(err, TwoNAuthError) for err in errors):
+                raise errors[0]
+            raise TwoNConnectionError("; ".join(str(err) for err in errors) or "no data")
         return TwoNState(
-            ports=None if ports is None else {p["port"]: p["state"] for p in ports},
-            switches=(
-                None if switches is None else {s["switch"]: bool(s["active"]) for s in switches}
-            ),
+            ports=ports,
+            switches=switches,
             events_online=events is not None,
             events=events or [],
         )
