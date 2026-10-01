@@ -1,14 +1,14 @@
 {
-  "domain": "2N",
+  "domain": "hass2n",
   "name": "2N Intercom",
-  "version": "0.1.0",
-  "integration_type": "device",
   "codeowners": [
     "@reedr"
   ],
   "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/2n",
+  "documentation": "https://github.com/reedr/ha-2n",
+  "integration_type": "device",
   "iot_class": "local_polling",
-  "quality_scale": "bronze",
-  "requirements": []
+  "issue_tracker": "https://github.com/reedr/ha-2n/issues",
+  "requirements": [],
+  "version": "0.2.0"
 }

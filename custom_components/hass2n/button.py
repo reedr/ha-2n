@@ -1,48 +1,37 @@
-"""Support for ports as buttons."""
+"""Pulse a 2N switch for its configured time, as the keypad or an app would."""
 
 from __future__ import annotations
 
-from typing import Any
-
 from homeassistant.components.button import ButtonEntity
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .coordinator import Hass2NConfigEntry
-from .entity import Hass2NEntity
+from .coordinator import TwoNConfigEntry, TwoNCoordinator
+from .entity import TwoNEntity
+
+PARALLEL_UPDATES = 1
 
 
-async def async_setup_entry(hass: HomeAssistant,
-                            config_entry: Hass2NConfigEntry,
-                            async_add_entities: AddEntitiesCallback) -> None:
-    """Add sensors for passed config_entry in HA."""
-    coord = config_entry.runtime_data
-    switches = coord.data["switches"]
-    new_entities = [Hass2NButton(coord, switch["switch"], switch["active"]) for switch in switches]
-    if new_entities:
-        async_add_entities(new_entities)
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: TwoNConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add a trigger button per 2N switch."""
+    coord = entry.runtime_data
+    async_add_entities(TwoNTriggerButton(coord, n) for n in sorted(coord.data.switches or {}))
 
-class Hass2NButton(ButtonEntity, Hass2NEntity):
-    """Port state sensor."""
 
-    @property
-    def is_on(self):
-        """Return state."""
-        return self._state
+class TwoNTriggerButton(TwoNEntity, ButtonEntity):
+    """Trigger (pulse) a switch."""
 
-    @property
-    def entity_type(self) -> str:
-        """Type of entity."""
-        return "button"
+    _attr_icon = "mdi:gesture-tap-button"
 
-    async def async_press(self, **kwargs: Any) -> None:
-        """Turn the entity on."""
-        await self.coordinator.device.async_press(self._entity)
+    def __init__(self, coordinator: TwoNCoordinator, switch: int) -> None:
+        """Set up the button."""
+        super().__init__(coordinator, "button", switch)
+        self._attr_name = f"Switch {switch} trigger"
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        if self.coordinator.data is not None:
-            switch = next(sw for sw in self.coordinator.data["switches"] if sw["switch"] == self._entity)
-            self._state = switch["active"]
-            self.async_write_ha_state()
+    async def async_press(self) -> None:
+        """Pulse the switch."""
+        await self._async_run(self.coordinator.device.async_trigger(self._key))

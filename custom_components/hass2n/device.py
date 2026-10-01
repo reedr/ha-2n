@@ -1,187 +1,178 @@
-"""2N Device."""
+"""2N IP intercom HTTP API client."""
 
-from json.decoder import JSONDecodeError
+from __future__ import annotations
+
 import logging
 import re
+from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
-from homeassistant.core import HomeAssistant
+from . import const
 
 _LOGGER = logging.getLogger(__name__)
 
-MAX_KEEPALIVE_TIME = 30.0
 
-class Hass2NDeviceResponse:
-    """API return status."""
-
-    def __init__(self, resp: httpx.Response) -> None:
-        """Set it up."""
-        _LOGGER.debug("<- %d %s: %s", resp.status_code, resp.reason_phrase, re.sub("\\s+", " ", resp.text))
-        self._status_code = resp.status_code
-        if self._status_code == httpx.codes.OK:
-            try:
-                json = resp.json()
-                if json.get("success"):
-                    self._result = json.get("result")
-                    return
-            except JSONDecodeError:
-                _LOGGER.error("JSON decode error")
-
-            self._status_code = httpx.codes.INTERNAL_SERVER_ERROR
-        self._result = None
-
-    @property
-    def status_code(self) -> int:
-        """Return the last status."""
-        return self._status_code
-
-    @property
-    def result(self) -> dict | None:
-        """Return the result."""
-        return self._result
-
-    @property
-    def has_result(self) -> bool:
-        """Return true if result is valid."""
-        return self._status_code == httpx.codes.OK and self._result is not None
-
-    def result_value(self, key: str) -> str | None:
-        """Return value from result or None."""
-        if self.has_result:
-            return self._result.get(key)
-        return None
+class TwoNError(Exception):
+    """Base error."""
 
 
+class TwoNConnectionError(TwoNError):
+    """The intercom could not be reached or gave an unusable answer."""
 
-class Hass2NDevice:  # noqa: D101
-    """Device interface."""
+
+class TwoNAuthError(TwoNError):
+    """The intercom rejected the username or password."""
+
+
+@dataclass(frozen=True)
+class TwoNInfo:
+    """Identity from /api/system/info."""
+
+    device_id: str  # "2N:<mac>", as used in event payloads and unique IDs
+    name: str
+    model: str | None
+    serial: str | None
+    sw_version: str | None
+    mac: str
+    raw: dict[str, Any] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class TwoNState:
+    """One poll. A section is None when its API call failed."""
+
+    ports: dict[str, int] | None = None
+    switches: dict[int, bool] | None = None
+    events_online: bool = False
+    events: list[dict[str, Any]] = field(default_factory=list, compare=False)
+
+
+class TwoNDevice:
+    """A 2N IP intercom over HTTPS with digest auth."""
 
     def __init__(
-        self, hass: HomeAssistant, host: str, username: str, password: str
+        self,
+        host: str,
+        username: str,
+        password: str,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        """Set up class."""
+        """Set up the client. The intercom's certificate is self-signed."""
+        self.host = host
+        self._client = httpx.AsyncClient(
+            base_url=f"https://{host}",
+            auth=httpx.DigestAuth(username=username, password=password),
+            verify=False,
+            timeout=const.REQUEST_TIMEOUT,
+            transport=transport,
+        )
+        self._log_id: int | None = None
+        self.info: TwoNInfo | None = None
 
-        self._hass = hass
-        self._host = host
-        self._username = username
-        self._password = password
-        self._auth = httpx.DigestAuth(username=username, password=password)
-        self._client = httpx.AsyncClient(base_url="https://"+self._host,
-                                         auth=self._auth,
-                                         verify=False)
-        self._device_name = None
-        self._mac_addr = None
-        self._device_id = None
-        self._callbacks = set()
-        self._system_info: dict | None
-        self._log_id = None
-        self._response = None
-        self._switches_online = False
-        self._ports_online = False
-        self._events_online = False
+    async def async_close(self) -> None:
+        """Close the HTTP client."""
+        await self._client.aclose()
 
-    @property
-    def device_id(self) -> str:
-        """Use the mac."""
-        return self._device_id
+    async def _get(self, path: str) -> dict[str, Any]:
+        """GET an API path and return its result object."""
+        _LOGGER.debug("%s -> GET %s", self.host, path)
+        try:
+            resp = await self._client.get(path)
+        except httpx.HTTPError as err:
+            raise TwoNConnectionError(f"{self.host}: {err!r}") from err
+        _LOGGER.debug(
+            "%s <- %d %s", self.host, resp.status_code, re.sub(r"\s+", " ", resp.text)
+        )
+        if resp.status_code in (httpx.codes.UNAUTHORIZED, httpx.codes.FORBIDDEN):
+            raise TwoNAuthError(f"{self.host} rejected the login ({resp.status_code})")
+        if resp.status_code != httpx.codes.OK:
+            raise TwoNConnectionError(f"{self.host} {path}: HTTP {resp.status_code}")
+        try:
+            body = resp.json()
+        except ValueError as err:
+            raise TwoNConnectionError(f"{self.host} {path}: not JSON") from err
+        if not body.get("success"):
+            raise TwoNConnectionError(f"{self.host} {path}: {body.get('error')}")
+        return body.get("result") or {}
 
-    @property
-    def system_info(self) -> dict:
-        """Return device info."""
-        return self._system_info
+    async def async_get_info(self) -> TwoNInfo:
+        """Read the intercom's identity."""
+        result = await self._get("/api/system/info")
+        mac = result.get("macAddr")
+        if not mac:
+            raise TwoNConnectionError(f"{self.host} did not report a MAC address")
+        self.info = TwoNInfo(
+            device_id=f"2N:{mac}",
+            name=result.get("deviceName") or "2N Intercom",
+            model=result.get("variant"),
+            serial=result.get("serialNumber"),
+            sw_version=result.get("swVersion"),
+            mac=mac,
+            raw=result,
+        )
+        return self.info
 
-    @property
-    def ports_online(self) -> bool:
-        """Return online."""
-        return self._ports_online
+    async def async_update(self) -> TwoNState:
+        """Poll ports, switches and new log events.
 
-    @property
-    def switches_online(self) -> bool:
-        """Return online."""
-        return self._switches_online
+        Each section fails on its own, as the intercom can disable APIs one by
+        one. Only a wrong login, or every section failing, raises.
+        """
+        errors: list[TwoNError] = []
 
-    @property
-    def events_online(self) -> bool:
-        """Return online."""
-        return self._events_online
-
-    @property
-    def online(self) -> bool:
-        """Return any online."""
-        return self._events_online or self._ports_online or self._switches_online
-
-    async def api_call(self, uri: str) -> bool:
-        """Make an API call."""
-        tries = 2
-        while tries > 0:
+        async def section(path: str, key: str) -> list[dict[str, Any]] | None:
             try:
-                _LOGGER.debug("-> GET %s", uri)
-                resp = await self._client.get(uri)
-                self._response = Hass2NDeviceResponse(resp)
-                return self._response.status_code == httpx.codes.OK
+                return (await self._get(path)).get(key) or []
+            except TwoNAuthError:
+                raise
+            except TwoNError as err:
+                errors.append(err)
+                return None
 
-            except httpx.RemoteProtocolError as exc:
-                _LOGGER.error("GET error (%s): %s", self.device_id, exc)
-            tries -= 1
+        ports = await section("/api/io/status", "ports")
+        switches = await section("/api/switch/status", "switches")
 
-        return False
+        events: list[dict[str, Any]] | None = None
+        if self._log_id is None:
+            subscribed = await section("/api/log/subscribe", "id")
+            self._log_id = subscribed if isinstance(subscribed, int) else None
+        if self._log_id is not None:
+            events = await section(f"/api/log/pull?id={self._log_id}", "events")
+            if events is None:
+                # The subscription lapses when the intercom restarts.
+                self._log_id = None
 
-    async def api_get(self, uri: str) -> bool:
-        """Get some API info."""
-        return await self.api_call(uri) and self._response.has_result
+        if ports is None and switches is None and events is None:
+            raise TwoNConnectionError("; ".join(str(err) for err in errors))
+        return TwoNState(
+            ports=None if ports is None else {p["port"]: p["state"] for p in ports},
+            switches=(
+                None if switches is None else {s["switch"]: bool(s["active"]) for s in switches}
+            ),
+            events_online=events is not None,
+            events=events or [],
+        )
 
-    async def get_system_info(self) -> bool:
-        """Load initial system info."""
-        if not await self.api_get("/api/system/info"):
-            return False
+    async def _switch(self, switch: int, action: str) -> None:
+        await self._get(f"/api/switch/ctrl?switch={switch}&action={action}")
 
-        self._system_info = self._response.result
-        self._device_name = self._response.result_value("deviceName")
-        self._mac_addr = self._response.result_value("macAddr")
-        self._device_id = "2N:" + self._mac_addr
-        return True
+    async def async_turn_on(self, switch: int) -> None:
+        """Activate a switch until turned off."""
+        await self._switch(switch, "on")
 
-    async def get_status(self) -> dict | None:
-        """Load the current status."""
-        status = {}
-        self._ports_online = await self.api_get("/api/io/status")
-        if self._ports_online:
-            status["ports"] = self._response.result_value("ports")
+    async def async_turn_off(self, switch: int) -> None:
+        """Deactivate a switch."""
+        await self._switch(switch, "off")
 
-        self._switches_online = await self.api_get("/api/switch/status")
-        if self._switches_online:
-            status["switches"] = self._response.result_value("switches")
+    async def async_trigger(self, switch: int) -> None:
+        """Pulse a switch for its configured time (e.g. a door strike)."""
+        await self._switch(switch, "trigger")
 
-        if self._log_id is None and await self.api_get("/api/log/subscribe"):
-            self._log_id = self._response.result_value("id")
-
-        self._events_online = (self._log_id is not None
-                               and await self.api_get(f"/api/log/pull?id={self._log_id}"))
-        if self._events_online:
-            status["events"] = self._response.result_value("events")
-        else:
-            self._log_id = None
-
-        return status
-
-    async def async_turn_on (self, key: str) -> bool:
-        """Turn sw on."""
-        return await self.api_call(f"/api/switch/ctrl?switch={key}&action=on")
-
-    async def async_turn_off (self, key: str) -> bool:
-        """Turn sw off."""
-        return await self.api_call(f"/api/switch/ctrl?switch={key}&action=off")
-
-    async def async_press (self, key: str) -> bool:
-        """Momentary sw."""
-        return await self.api_call(f"/api/switch/ctrl?switch={key}&action=trigger")
-
-
-    def register_callback(self, callback) -> None:
-        """Register callback, called when device changes state."""
-        self._callbacks.add(callback)
-
-    def remove_callback(self, callback) -> None:
-        """Remove previously registered callback."""
-        self._callbacks.discard(callback)
+    async def async_test_connection(self) -> TwoNInfo:
+        """Read the identity and close."""
+        try:
+            return await self.async_get_info()
+        finally:
+            await self.async_close()

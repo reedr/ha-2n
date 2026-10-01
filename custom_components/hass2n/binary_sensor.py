@@ -1,74 +1,71 @@
-"""Platform for sensor integration."""
+"""2N I/O ports, and whether the event log is being followed."""
 
-import logging
+from __future__ import annotations
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .coordinator import Hass2NConfigEntry
-from .entity import Hass2NEntity
+from .coordinator import TwoNConfigEntry, TwoNCoordinator
+from .entity import TwoNEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
-async def async_setup_entry(hass: HomeAssistant,
-                            config_entry: Hass2NConfigEntry,
-                            async_add_entities: AddEntitiesCallback) -> None:
-    """Add sensors for passed config_entry in HA."""
-    coord = config_entry.runtime_data
-    ports = coord.data["ports"]
-    new_entities = [Hass2NPortSensor(coord, port["port"], port["state"]) for port in ports]
-    if new_entities:
-        async_add_entities(new_entities)
-    async_add_entities([Hass2NEventSensor(coord, "tracking", False)])
+_PORT_CLASSES = {"tamper": BinarySensorDeviceClass.TAMPER}
 
-class Hass2NPortSensor(BinarySensorEntity,Hass2NEntity):
-    """Port state sensor."""
 
-    @property
-    def is_on(self):
-        """Return state."""
-        return self._state == 1
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: TwoNConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add a sensor per I/O port, plus event-log tracking."""
+    coord = entry.runtime_data
+    entities: list[BinarySensorEntity] = [
+        TwoNPortSensor(coord, port) for port in sorted(coord.data.ports or {})
+    ]
+    entities.append(TwoNEventTrackingSensor(coord))
+    async_add_entities(entities)
 
-    @property
-    def entity_type(self) -> str:
-        """Type of entity."""
-        return "port"
 
-    @property
-    def available(self) -> bool:
-        """"Return online state."""
-        return self.coordinator.device.ports_online
+class TwoNPortSensor(TwoNEntity, BinarySensorEntity):
+    """An input, output, relay, LED or tamper port."""
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-#       _LOGGER.error(f"{self.coordinator.data} {self._entity}")
-        if self.coordinator.data is not None:
-            port = next(p for p in self.coordinator.data["ports"] if p["port"] == self._entity)
-            self._state = port["state"]
-            self.async_write_ha_state()
-
-class Hass2NEventSensor(BinarySensorEntity,Hass2NEntity):
-    """Port state sensor."""
-
-    @property
-    def is_on(self):
-        """Return state."""
-        self._state = self.coordinator.device.events_online
-        return self._state
-
-    @property
-    def entity_type(self) -> str:
-        """Type of entity."""
-        return "event"
+    def __init__(self, coordinator: TwoNCoordinator, port: str) -> None:
+        """Set up the sensor."""
+        super().__init__(coordinator, "port", port)
+        self._attr_name = f"Port {port}"
+        self._attr_device_class = _PORT_CLASSES.get(port)
 
     @property
     def available(self) -> bool:
-        """"Return online state."""
-        return self.coordinator.device.online
+        """Unavailable while the I/O API isn't answering or the port has gone."""
+        ports = self.coordinator.data.ports
+        return super().available and ports is not None and self._key in ports
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        self.async_write_ha_state()
+    @property
+    def is_on(self) -> bool | None:
+        """Whether the port is active."""
+        state = (self.coordinator.data.ports or {}).get(self._key)
+        return None if state is None else state == 1
+
+
+class TwoNEventTrackingSensor(TwoNEntity, BinarySensorEntity):
+    """On while the intercom's event log is being followed (events reach HA)."""
+
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "event_tracking"
+
+    def __init__(self, coordinator: TwoNCoordinator) -> None:
+        """Set up the sensor."""
+        super().__init__(coordinator, "event", "tracking")
+
+    @property
+    def is_on(self) -> bool:
+        """Whether events are being received."""
+        return self.coordinator.data.events_online

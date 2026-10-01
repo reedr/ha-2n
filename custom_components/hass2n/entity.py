@@ -1,66 +1,48 @@
-"""2N Entity Base class."""
+"""Base entity for 2N intercoms."""
 
-import logging
+from __future__ import annotations
 
+from collections.abc import Awaitable
+
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
-from .coordinator import Hass2NCoordinator
-from .device import Hass2NDevice
+from .coordinator import TwoNCoordinator
+from .device import TwoNError
 
-_LOGGER = logging.getLogger(__name__)
 
-class Hass2NEntity(CoordinatorEntity[Hass2NCoordinator]):
-    """Base class."""
+class TwoNEntity(CoordinatorEntity[TwoNCoordinator]):
+    """An entity of one intercom.
 
-    def __init__(self, coordinator: Hass2NCoordinator, entity: str, state: str) -> None:
-        """Set up entity."""
-        super().__init__(coordinator, entity)
+    Unique IDs are ``<kind>_2N:<mac>_<key>``, unchanged from the pre-HACS package.
+    """
 
-        self._entity = entity
-        self._state = state
-        self._attr_name = f"{self.entity_type} {entity}"
-        self._attr_unique_id = f"{self.entity_type}_{self.coordinator.device.device_id}_{self.device_id}"
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator: TwoNCoordinator, kind: str, key: str | int) -> None:
+        """Set up the entity."""
+        super().__init__(coordinator)
+        info = coordinator.info
+        self._key = key
+        self._attr_unique_id = f"{kind}_{info.device_id}_{key}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, self.unique_id)},
+            identifiers={(DOMAIN, info.device_id)},
+            connections={(dr.CONNECTION_NETWORK_MAC, info.mac)},
             manufacturer=MANUFACTURER,
-            model=coordinator.device.system_info["variant"],
-            name=coordinator.device.device_id,
-            sw_version=coordinator.device.system_info["swVersion"],
-            connections={
-                (dr.CONNECTION_NETWORK_MAC, coordinator.device.system_info["macAddr"])
-            }
+            model=info.model,
+            name=info.name,
+            serial_number=info.serial,
+            sw_version=info.sw_version,
+            configuration_url=f"https://{coordinator.device.host}",
         )
 
-#        _LOGGER.error(f"new entity={entity} state={state} name={self._attr_name} unique_id={self.unique_id}")
-
-    @property
-    def entity_type(self) -> str | None:
-        """Type of entity."""
-        return None
-
-    @property
-    def device_id(self):
-        """Return entity id."""
-        return self._entity
-
-    @property
-    def extra_state_attributes(self):
-        """Return the state attributes."""
-        return {"device_id": self.device_id}
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return information to link this entity with the correct device."""
-        return self._attr_device_info
-
-    @property
-    def device(self) -> Hass2NDevice:
-        """Return device."""
-        return self.coordinator.device
-
-    async def api_get(self, uri: str) -> bool:
-        """Call the api."""
-        return await self.device.api_get(uri)
+    async def _async_run(self, command: Awaitable[None]) -> None:
+        """Run a device command, then refresh."""
+        try:
+            await command
+        except TwoNError as err:
+            raise HomeAssistantError(f"2N {self.coordinator.device.host}: {err}") from err
+        await self.coordinator.async_request_refresh()

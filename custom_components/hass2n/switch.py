@@ -1,65 +1,52 @@
-"""Support for ESPHome switches."""
+"""2N switches (relay/lock outputs), held on until turned off."""
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .coordinator import Hass2NConfigEntry
-from .entity import Hass2NEntity
+from .coordinator import TwoNConfigEntry, TwoNCoordinator
+from .entity import TwoNEntity
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 1
 
-async def async_setup_entry(hass: HomeAssistant,
-                            config_entry: Hass2NConfigEntry,
-                            async_add_entities: AddEntitiesCallback) -> None:
-    """Add sensors for passed config_entry in HA."""
-    coord = config_entry.runtime_data
-    switches = coord.data["switches"]
-    new_entities = [Hass2NSwitch(coord, switch["switch"], switch["active"]) for switch in switches]
-    if new_entities:
-        async_add_entities(new_entities)
 
-class Hass2NSwitch(SwitchEntity, Hass2NEntity):
-    """Port state sensor."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: TwoNConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add a switch per 2N switch."""
+    coord = entry.runtime_data
+    async_add_entities(TwoNSwitch(coord, n) for n in sorted(coord.data.switches or {}))
 
-    @property
-    def is_on(self):
-        """Return state."""
-        return self._state
 
-    @property
-    def entity_type(self) -> str:
-        """Type of entity."""
-        return "switch"
+class TwoNSwitch(TwoNEntity, SwitchEntity):
+    """A 2N switch."""
+
+    def __init__(self, coordinator: TwoNCoordinator, switch: int) -> None:
+        """Set up the switch."""
+        super().__init__(coordinator, "switch", switch)
+        self._attr_name = f"Switch {switch}"
 
     @property
     def available(self) -> bool:
-        """"Return online state."""
-        return self.coordinator.device.switches_online
+        """Unavailable while the switch API isn't answering."""
+        return super().available and self.coordinator.data.switches is not None
+
+    @property
+    def is_on(self) -> bool | None:
+        """Whether the switch is active."""
+        switches = self.coordinator.data.switches or {}
+        return switches.get(self._key)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the entity on."""
-        if await self.coordinator.device.async_turn_on(self._entity):
-            self._state = True
-            _LOGGER.debug("turned on")
-            self.schedule_update_ha_state(True)
+        """Activate the switch."""
+        await self._async_run(self.coordinator.device.async_turn_on(self._key))
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the entity off."""
-        if await self.coordinator.device.async_turn_off(self._entity):
-            self._state = False
-            self.schedule_update_ha_state(True)
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        if self.coordinator.device is not None:
-            switch = next(sw for sw in self.coordinator.data["switches"] if sw["switch"] == self._entity)
-            _LOGGER.debug("hcu: active=%s", switch["active"])
-            self._state = switch["active"]
-            self.async_write_ha_state()
+        """Deactivate the switch."""
+        await self._async_run(self.coordinator.device.async_turn_off(self._key))
