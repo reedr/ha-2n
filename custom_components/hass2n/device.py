@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -20,6 +21,10 @@ class TwoNError(Exception):
 
 class TwoNConnectionError(TwoNError):
     """The intercom could not be reached or gave an unusable answer."""
+
+
+class TwoNNetworkError(TwoNConnectionError):
+    """The request never got an answer: refused, dropped or timed out."""
 
 
 class TwoNAuthError(TwoNError):
@@ -47,6 +52,8 @@ class TwoNState:
     switches: dict[int, bool] | None = None
     events_online: bool = False
     events: list[dict[str, Any]] = field(default_factory=list, compare=False)
+    # A section failed on the network rather than on the intercom's API.
+    network_error: bool = field(default=False, compare=False)
 
 
 def _parse(
@@ -95,7 +102,17 @@ class TwoNDevice:
         """GET an API path and return its result object."""
         _LOGGER.debug("%s -> GET %s", self.host, path)
         try:
-            resp = await self._client.get(path)
+            try:
+                resp = await self._client.get(path)
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as err:
+                # A keep-alive connection dropped while idle, or a short blip on
+                # the path: one retry on a fresh connection. Timeouts aren't
+                # retried, as they have already waited REQUEST_TIMEOUT.
+                _LOGGER.debug("%s %s: %r, retrying", self.host, path, err)
+                await asyncio.sleep(const.RETRY_DELAY)
+                resp = await self._client.get(path)
+        except httpx.TransportError as err:
+            raise TwoNNetworkError(f"{self.host}: {err!r}") from err
         except (httpx.HTTPError, httpx.InvalidURL, RuntimeError) as err:
             # RuntimeError: the client was closed under us (entry unloading).
             raise TwoNConnectionError(f"{self.host}: {err!r}") from err
@@ -163,21 +180,29 @@ class TwoNDevice:
         if self._log_id is not None:
             pulled = await section(f"/api/log/pull?id={self._log_id}")
             if pulled is None:
-                # The subscription lapses when the intercom restarts.
-                self._log_id = None
+                # The subscription lapses when the intercom restarts, and the
+                # intercom then refuses the old id. A network failure leaves it
+                # alive: keep it, so the events from the gap arrive next poll.
+                if not isinstance(errors[-1], TwoNNetworkError):
+                    self._log_id = None
             else:
                 raw = pulled.get("events")
                 events = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
 
+        network_error = any(isinstance(err, TwoNNetworkError) for err in errors)
         if ports is None and switches is None and events is None:
             if errors and all(isinstance(err, TwoNAuthError) for err in errors):
                 raise errors[0]
-            raise TwoNConnectionError("; ".join(str(err) for err in errors) or "no data")
+            message = "; ".join(str(err) for err in errors) or "no data"
+            if network_error:
+                raise TwoNNetworkError(message)
+            raise TwoNConnectionError(message)
         return TwoNState(
             ports=ports,
             switches=switches,
             events_online=events is not None,
             events=events or [],
+            network_error=network_error,
         )
 
     async def _switch(self, switch: int, action: str) -> None:

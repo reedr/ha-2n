@@ -24,6 +24,13 @@ def enable_hass2n(enable_custom_integrations):
     """Allow Home Assistant to load the custom integration under test."""
 
 
+@pytest.fixture(autouse=True)
+def no_retry_delay() -> Generator[None]:
+    """Retry dropped requests without the real pause."""
+    with patch("custom_components.hass2n.const.RETRY_DELAY", 0):
+        yield
+
+
 @pytest.fixture
 def network() -> Generator[FakeNetwork]:
     """Two fake intercoms, reached through a mock transport."""

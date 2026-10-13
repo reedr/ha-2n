@@ -37,6 +37,11 @@ Enable the HTTP API (**Services → HTTP API**) over HTTPS with digest authentic
 account with access to **System**, **I/O**, **Switches** and **Logging**. A missing permission
 only takes out that part: e.g. without Switches, the switch entities stay unavailable.
 
+Short network blips are ridden out: a request on a dropped connection is retried once, and the
+entities keep their last state until 3 polls in a row (about 15 s) fail on the network. The event
+log subscription survives a blip, so events from the gap arrive on the next good poll. Errors
+from the intercom itself (an API disabled or refused) still show at once.
+
 ## Install
 
 Add this repository to HACS as a custom repository (category: Integration), download

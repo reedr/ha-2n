@@ -18,6 +18,7 @@ class FakeIntercom:
         self.switches = dict.fromkeys(range(1, switches + 1), False)
         self.password_ok = True
         self.down = False
+        self.drop_next = 0  # requests to drop as a dead keep-alive connection would
         self.disabled: set[str] = set()
         self.denied: set[str] = set()
         self.garbled = False
@@ -31,6 +32,11 @@ class FakeIntercom:
     def handle(self, request: httpx.Request) -> httpx.Response:
         if self.down:
             raise httpx.ConnectError("down", request=request)
+        if self.drop_next:
+            self.drop_next -= 1
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response.", request=request
+            )
         if "authorization" not in request.headers:
             return httpx.Response(
                 401,

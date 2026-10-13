@@ -17,7 +17,7 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
 )
 
-from custom_components.hass2n.const import DOMAIN, EVENT
+from custom_components.hass2n.const import DOMAIN, EVENT, UNAVAILABLE_AFTER
 
 from .conftest import GATE, GATE_MAC
 
@@ -32,6 +32,12 @@ async def _setup(hass: HomeAssistant) -> MockConfigEntry:
 
 async def _tick(hass: HomeAssistant) -> None:
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=6))
+    await hass.async_block_till_done()
+
+
+async def _poll(hass: HomeAssistant) -> None:
+    """Run exactly one poll (the tests below count them)."""
+    await hass.config_entries.async_entries(DOMAIN)[0].runtime_data.async_refresh()
     await hass.async_block_till_done()
 
 
@@ -111,7 +117,8 @@ async def test_partial_and_full_outage(hass: HomeAssistant, network) -> None:
     assert hass.states.get("binary_sensor.gate_port_relay1").state == STATE_OFF
 
     gate.down = True
-    await _tick(hass)
+    for _ in range(UNAVAILABLE_AFTER):
+        await _poll(hass)
     assert hass.states.get("binary_sensor.gate_port_relay1").state == STATE_UNAVAILABLE
 
     gate.down = False
@@ -200,3 +207,79 @@ async def test_legacy_device_id_attribute(hass: HomeAssistant, network) -> None:
     await _setup(hass)
     assert hass.states.get("switch.gate_switch_1").attributes["device_id"] == 1
     assert hass.states.get("binary_sensor.gate_port_relay1").attributes["device_id"] == "relay1"
+
+
+async def test_short_network_blip_keeps_state(hass: HomeAssistant, network) -> None:
+    """A blip shorter than UNAVAILABLE_AFTER polls doesn't flip entities."""
+    await _setup(hass)
+    gate = network.intercoms[GATE["host"]]
+    gate.down = True
+    for _ in range(UNAVAILABLE_AFTER - 1):
+        await _poll(hass)
+        assert hass.states.get("switch.gate_switch_1").state == STATE_OFF
+        assert hass.states.get("binary_sensor.gate_port_relay1").state == STATE_OFF
+        assert hass.states.get("binary_sensor.gate_event_tracking").state == STATE_ON
+    await _poll(hass)
+    assert hass.states.get("switch.gate_switch_1").state == STATE_UNAVAILABLE
+
+    gate.down = False
+    await _poll(hass)
+    assert hass.states.get("switch.gate_switch_1").state == STATE_OFF
+
+    # The count starts over after a good poll.
+    gate.down = True
+    for _ in range(UNAVAILABLE_AFTER - 1):
+        await _poll(hass)
+    assert hass.states.get("switch.gate_switch_1").state == STATE_OFF
+
+
+async def test_api_error_is_not_ridden_out(hass: HomeAssistant, network) -> None:
+    """The intercom answering with errors is not a network blip."""
+    await _setup(hass)
+    gate = network.intercoms[GATE["host"]]
+    gate.disabled = {"io", "switch", "log"}
+    await _poll(hass)
+    assert hass.states.get("switch.gate_switch_1").state == STATE_UNAVAILABLE
+
+
+async def test_dropped_connection_is_retried(hass: HomeAssistant, network) -> None:
+    """A request on a dead keep-alive connection is retried, unseen."""
+    await _setup(hass)
+    gate = network.intercoms[GATE["host"]]
+    gate.switches[1] = True
+    gate.drop_next = 1
+    await _poll(hass)
+    assert hass.states.get("switch.gate_switch_1").state == STATE_ON
+
+    gate.drop_next = 1
+    await hass.services.async_call(
+        "switch", "turn_off", {"entity_id": "switch.gate_switch_1"}, blocking=True
+    )
+    assert gate.switches[1] is False
+
+
+async def test_partial_network_failure_keeps_section(hass: HomeAssistant, network) -> None:
+    """One section lost on the network keeps its last value for a while."""
+    await _setup(hass)
+    gate = network.intercoms[GATE["host"]]
+    gate.drop_next = 2  # the I/O request and its retry
+    await _poll(hass)
+    assert hass.states.get("binary_sensor.gate_port_relay1").state == STATE_OFF
+    assert hass.states.get("switch.gate_switch_1").state == STATE_OFF
+
+
+async def test_events_from_network_gap_arrive(hass: HomeAssistant, network) -> None:
+    """A network gap keeps the log subscription, so its events aren't lost."""
+    await _setup(hass)
+    gate = network.intercoms[GATE["host"]]
+    events = async_capture_events(hass, EVENT)
+    subscriptions = set(gate.log_ids)
+
+    gate.down = True
+    await _poll(hass)
+    gate.pending_events = [{"id": 9, "utcTime": 1790000100, "event": "CodeEntered"}]
+    gate.down = False
+    await _poll(hass)
+
+    assert [e.data["id"] for e in events] == [9]
+    assert gate.log_ids == subscriptions
